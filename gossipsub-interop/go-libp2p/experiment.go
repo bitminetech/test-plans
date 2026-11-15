@@ -8,6 +8,7 @@ import (
 	"log"
 	"log/slog"
 	"slices"
+	"sync"
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -52,6 +53,25 @@ type partialMsgManager struct {
 	partialMessages map[string]map[string]*PartialMessage
 
 	pubsub *pubsub.PubSub
+
+	// Work from the callbacks of the pubsub event loop, in order. The
+	// callbacks must not block: the manager calls PublishPartial, which waits
+	// for that same event loop, so a blocking send from a callback can
+	// deadlock both.
+	mu       sync.Mutex
+	fromLoop []func()
+	wake     chan struct{}
+}
+
+// fromEventLoop queues work from a callback of the pubsub event loop. It never blocks.
+func (m *partialMsgManager) fromEventLoop(f func()) {
+	m.mu.Lock()
+	m.fromLoop = append(m.fromLoop, f)
+	m.mu.Unlock()
+	select {
+	case m.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (m *partialMsgManager) start(logger *slog.Logger, pubsub *pubsub.PubSub) {
@@ -62,6 +82,7 @@ func (m *partialMsgManager) start(logger *slog.Logger, pubsub *pubsub.PubSub) {
 	m.add = make(chan partialMsgWithTopic)
 	m.partialMessages = make(map[string]map[string]*PartialMessage)
 	m.pubsub = pubsub
+	m.wake = make(chan struct{}, 1)
 	go m.run()
 }
 func (m *partialMsgManager) close() {
@@ -80,19 +101,31 @@ func (m *partialMsgManager) run() {
 			m.Info("Adding partial message")
 			m.addMsg(req)
 		case req := <-m.publish:
-			pm := m.partialMessages[req.topic][string(req.groupID)]
-			m.Info("publishing partial message", "groupID", hex.EncodeToString(pm.GroupID()), "topic", req.topic, "peers", req.publishToPeers)
-			if len(req.publishToPeers) > 0 {
-				pm.peersToPublishTo = slices.Values(req.publishToPeers)
-			}
-			err := pubsub.PublishPartial(m.pubsub, req.topic, pm.groupID[:], pm.PublishActions)
-			pm.peersToPublishTo = nil
-			if err != nil {
-				m.Error("failed to publish partial message", "err", err)
+			m.publishGroup(req)
+		case <-m.wake:
+			m.mu.Lock()
+			work := m.fromLoop
+			m.fromLoop = nil
+			m.mu.Unlock()
+			for _, f := range work {
+				f()
 			}
 		case <-m.done:
 			return
 		}
+	}
+}
+
+func (m *partialMsgManager) publishGroup(req publishReq) {
+	pm := m.partialMessages[req.topic][string(req.groupID)]
+	m.Info("publishing partial message", "groupID", hex.EncodeToString(pm.GroupID()), "topic", req.topic, "peers", req.publishToPeers)
+	if len(req.publishToPeers) > 0 {
+		pm.peersToPublishTo = slices.Values(req.publishToPeers)
+	}
+	err := pubsub.PublishPartial(m.pubsub, req.topic, pm.groupID[:], pm.PublishActions)
+	pm.peersToPublishTo = nil
+	if err != nil {
+		m.Error("failed to publish partial message", "err", err)
 	}
 }
 
@@ -204,18 +237,23 @@ func (n *scriptedNode) runInstruction(ctx context.Context, instruction ScriptIns
 					pState.sentPartsMetadata |= partBitmap
 				}
 				peerStates[from] = pState
-				n.partialMsgMgr.incomingRPC <- incomingPartialRPC{
+				in := incomingPartialRPC{
 					from:                     from,
 					PartialMessagesExtension: *rpc,
 				}
+				n.partialMsgMgr.fromEventLoop(func() {
+					n.partialMsgMgr.Info("Received partial RPC")
+					n.partialMsgMgr.handleRPC(in)
+				})
 
 				return nil
 			},
 			OnEmitGossip: func(topic string, groupID []byte, gossipPeers []peer.ID, peerStates map[peer.ID]peerState) {
-				n.partialMsgMgr.publish <- publishReq{
+				req := publishReq{
 					topic:   topic,
 					groupID: groupID,
 				}
+				n.partialMsgMgr.fromEventLoop(func() { n.partialMsgMgr.publishGroup(req) })
 			},
 		}
 
