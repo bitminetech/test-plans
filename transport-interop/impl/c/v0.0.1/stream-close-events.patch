@@ -1,0 +1,32 @@
+c-libp2p 23a6172: no close events for a stream that never opened.
+
+libp2p_stream_close emitted STREAM_CLOSED and CONN_CLOSED for every stream
+with a host, also for an inbound stream whose protocol was refused ("na"),
+which never emitted STREAM_OPENED. The interop listener counts STREAM_OPENED
+and STREAM_CLOSED and stops when the count falls to 0 after the ping stream
+opened. When a dialer opens a stream the listener refuses and that close
+lands after the ping stream opened, the listener stopped in the middle of
+the ping, and freed streams that its callback and ping threads still used
+(heap use after free, seen with AddressSanitizer).
+
+A stream has a protocol once its negotiation succeeded, so close events are
+now emitted only for a stream with a protocol.
+
+diff --git a/src/stream/stream.c b/src/stream/stream.c
+index f36b980..54a6f6c 100644
+--- a/src/stream/stream.c
++++ b/src/stream/stream.c
+@@ -169,8 +169,11 @@ int libp2p_stream_close(libp2p_stream_t *s)
+         rc = libp2p_conn_close(st->c);
+     else
+         rc = LIBP2P_ERR_NULL_PTR;
+-    /* Emit stream/conn closed events if we have a host */
+-    if (st->host)
++    /* Emit stream/conn closed events if we have a host. A stream with no
++     * protocol never finished negotiation and never emitted STREAM_OPENED, so
++     * it emits no close events either: closing a refused inbound stream must
++     * not look like the close of an open stream. */
++    if (st->host && st->proto)
+     {
+         {
+             libp2p_event_t evt = {0};

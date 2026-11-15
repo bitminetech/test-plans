@@ -9,6 +9,7 @@ image.json:
 	rm -rf $(dir_name)
 	git clone $(repo_url) $(dir_name)
 	cd $(dir_name) && git checkout $(commitSha)
+	cd $(dir_name) && git apply ../stream-close-events.patch
 	cd $(dir_name) && git submodule update --init --recursive external/picoquic
 	cd $(dir_name) && \
 	mkdir -p external/secp256k1 && wget -O secp256k1.zip https://github.com/bitcoin-core/secp256k1/archive/master.zip && unzip -o secp256k1.zip && mv secp256k1-master/* external/secp256k1/ && rm -rf secp256k1.zip secp256k1-master && \
